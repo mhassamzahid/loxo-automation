@@ -88,6 +88,21 @@ CV_EVENT_KEYS = {"moved_to_cv_sent", "delivery_cv_sends"}
 # A company with more people than this gets its people queried in batches.
 ID_BATCH_SIZE = 25
 
+# Only companies tagged "Active Account" on this custom hierarchy field are
+# processed. custom_hierarchy_5 is a list of {id, value} tags on each
+# company (a company can carry more than one, e.g. both "Active Account"
+# and "Archive"), present directly on the /companies list response - no
+# extra API call needed. Filtered client-side: the server-side Lucene query
+# for this field is unreliable for multi-word values (confirmed live -
+# query=custom_hierarchy_5:Active Account also matched companies tagged
+# only "Passive Account", since unquoted terms get OR'd rather than
+# phrase-matched).
+ACTIVE_ACCOUNT_VALUE = "Active Account"
+
+
+def is_active_account(company):
+    return any(v.get("value") == ACTIVE_ACCOUNT_VALUE for v in company.get("custom_hierarchy_5") or [])
+
 
 def load_token():
     """Read the bearer token out of .env. Supports KEY=VALUE lines
@@ -248,15 +263,20 @@ def run(session, workers, resume, limit=None):
     write_header = not (resume and os.path.exists(COMPANY_CSV))
     file_mode = "a" if (resume and os.path.exists(COMPANY_CSV)) else "w"
 
-    print("Fetching companies list (paginating)...")
+    print("Fetching companies list (paginating, filtering to Active Account)...")
     companies = []
+    skipped = 0
     for c in paginate(session, "companies", per_page=100):
+        if not is_active_account(c):
+            skipped += 1
+            continue
         cid = str(c["id"])
         if cid in processed_ids:
             continue
         companies.append({"id": cid, "name": c.get("name") or ""})
         if limit and len(companies) >= limit:
             break
+    print(f"  skipped {skipped} companies not marked Active Account.")
     print(f"Found {len(companies)} companies left to process "
           f"({len(processed_ids)} already done, resuming)." if processed_ids
           else f"Found {len(companies)} companies.")
