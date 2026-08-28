@@ -3,28 +3,44 @@
 Loxo company report - one script, one output file: output/company_report.csv
 (Company ID, Company Name, Total Jobs, Total CVs, Total Revenue)
 
-Flow, exactly as scoped per company (no global full-table scans):
-    1. GET /companies                            - every company (scroll-paginated)
-    2. GET /companies/{id}/people                 - that company's people -> person ids
-    3. GET /placements?query=person_id:(id1 OR id2 ...)
-                                                    - placements for exactly those people,
-                                                      summed into revenue (formula below)
-    4. GET /person_events?query=person_id:(id1 OR id2 ...)
-                                                    - events for exactly those people:
+IMPORTANT: revenue/jobs/CVs are attributed via placements[].job.company -
+i.e. the company a candidate was PLACED AT - not via /companies/{id}/people
+(that endpoint lists a company's own contacts/staff, which is a different,
+unrelated set of people from the candidates actually placed there. Confirmed
+with real data: KENPAT (company 3846712) has $51,000 of real revenue from
+2 placements, but the candidate on both is person 4863774, who does not
+appear anywhere in KENPAT's own 11-person contact list. Attributing by
+contacts silently produced $0 for a company that actually made $51,000 -
+that bug is why this now reads placements directly instead.)
+
+Flow:
+    1. GET /placements                            - every placement, ONE full scan
+                                                      (no company filter exists on this
+                                                      endpoint - see below), grouped by
+                                                      job.company.id into:
+                                                        - summed revenue (formula below)
+                                                        - the set of person_ids placed there
+    2. GET /companies                             - every company (scroll-paginated),
+                                                      for the canonical id/name list
+    3. GET /person_events?query=person_id:(id1 OR id2 ...)
+                                                    - only for companies that had at least
+                                                      one placement, scoped to exactly the
+                                                      candidates placed there:
                                                         - Total CVs: activity_type.key is a
                                                           CV-sent type (moved_to_cv_sent,
                                                           delivery_cv_sends)
                                                         - Total Jobs: distinct job_id values
                                                           across those events
+    A company with zero placements gets 0/0/0 with no extra API calls at all.
 
-`person_id` is not a plain query-string param on /placements (that 422s) - it's a field
-inside the `query` param's Lucene syntax, confirmed against the Loxo OpenAPI spec and
-tested live: query=person_id:(111 OR 222) returns exactly the placements/events for
-those people. This is what "query by people id" means on this API. A company's people
-are batched into groups of up to ID_BATCH_SIZE to keep the query string a sane length.
-
-For each company, Total Jobs / Total CVs / Total Revenue are the SUM of its own
-people's individual numbers - one row per company, never summed across companies.
+Why a full /placements scan instead of a scoped query: person_id works as a
+Lucene query field (query=person_id:(111 OR 222), confirmed live and used
+for step 3), but company_id does not - it's not one of the fields the
+/placements search indexes (confirmed against the Loxo OpenAPI spec: the
+only structured filter is job_id, and the free-text query only fuzzy-matches
+company_name, it doesn't exact-match company_id). /placements is small
+(~1300 records) so a full scan is fast and, unlike a fuzzy name search,
+guaranteed complete.
 
 Revenue per placement:
     - fee_type "percentage": salary * (fee / 100)
@@ -162,21 +178,43 @@ def compute_revenue(p):
     return bill_rate - pay_rate
 
 
-def fetch_company_people(session, company_id):
-    person_ids = []
-    for person in paginate(session, f"companies/{company_id}/people"):
-        if person.get("id") is not None:
-            person_ids.append(person["id"])
-    return person_ids
+def is_dropout(p):
+    """Dropout placements are internal reversal/adjustment records (a
+    candidate who fell through), not real revenue. Confirmed with a real
+    example: Western Building Group placement 48128 has job_type "Dropout",
+    fee -22667.43, and notes literally saying "this is just adding the
+    actual dropout onto the figures ... a credit is not necessary anymore" -
+    summing it in double-counted against the same candidate's real
+    placement and undercounted revenue by that amount."""
+    return (p.get("job_type") or {}).get("name") == "Dropout"
 
 
-def revenue_for_people(session, person_ids):
-    total = 0.0
-    for batch in chunked(person_ids, ID_BATCH_SIZE):
-        query = "person_id:(" + " OR ".join(str(i) for i in batch) + ")"
-        for p in paginate(session, "placements", params={"query": query}):
-            total += compute_revenue(p)
-    return total
+def build_company_placement_index(session):
+    """One full pass over /placements, grouped by job.company.id ->
+    {name, revenue (summed), person_ids (set of candidates placed there)}.
+    See the module docstring for why this must be a full scan rather than
+    a scoped query - /placements has no company_id filter."""
+    print("Indexing placements by company (GET /placements)...")
+    index = {}
+    count = 0
+    for p in paginate(session, "placements"):
+        if is_dropout(p):
+            count += 1
+            continue
+        job = p.get("job") or {}
+        company = job.get("company") or {}
+        person = p.get("person") or {}
+        if company.get("id") is not None:
+            cid = str(company["id"])
+            entry = index.setdefault(cid, {"name": company.get("name") or "", "revenue": 0.0, "person_ids": set()})
+            entry["revenue"] += compute_revenue(p)
+            if person.get("id") is not None:
+                entry["person_ids"].add(person["id"])
+        count += 1
+        if count % 200 == 0:
+            print(f"  processed {count} placements...")
+    print(f"  done: {count} placements across {len(index)} companies with placements.")
+    return index
 
 
 def jobs_and_cvs_for_people(session, person_ids):
@@ -203,6 +241,8 @@ def load_processed_ids(csv_path):
 
 def run(session, workers, resume, limit=None):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    company_index = build_company_placement_index(session)
 
     processed_ids = load_processed_ids(COMPANY_CSV) if resume else set()
     write_header = not (resume and os.path.exists(COMPANY_CSV))
@@ -234,13 +274,12 @@ def run(session, workers, resume, limit=None):
     lock = Lock()
 
     def worker(c):
+        entry = company_index.get(c["id"])
+        if not entry:
+            return {"Company ID": c["id"], "Company Name": c["name"], "Total Jobs": 0, "Total CVs": 0, "Total Revenue": 0.0}
+
         try:
-            person_ids = fetch_company_people(session, c["id"])
-            if person_ids:
-                revenue = revenue_for_people(session, person_ids)
-                total_jobs, total_cvs = jobs_and_cvs_for_people(session, person_ids)
-            else:
-                revenue, total_jobs, total_cvs = 0.0, 0, 0
+            total_jobs, total_cvs = jobs_and_cvs_for_people(session, entry["person_ids"])
         except requests.RequestException as e:
             print(f"  ! failed to process company {c['id']}: {e}", file=sys.stderr)
             return None
@@ -250,7 +289,7 @@ def run(session, workers, resume, limit=None):
             "Company Name": c["name"],
             "Total Jobs": total_jobs,
             "Total CVs": total_cvs,
-            "Total Revenue": round(revenue, 2),
+            "Total Revenue": round(entry["revenue"], 2),
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:

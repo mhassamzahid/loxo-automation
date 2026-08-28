@@ -1,10 +1,12 @@
 import { readFileSync } from "fs";
 import path from "path";
 
-// Port of loxo_report.py's core logic (companies -> people -> placements /
-// person_events, scoped per company via Lucene person_id:(id1 OR id2 ...)
-// queries) for a single live company lookup. See loxo_report.py for the
-// full documented flow and why each design choice was made.
+// Port of loxo_report.py's core logic for a single live company lookup:
+// find the company, get its placements (job.company.id match), sum
+// revenue, then query person_events for the candidates placed there
+// (Lucene person_id:(id1 OR id2 ...)) for jobs/CVs. See loxo_report.py's
+// module docstring for the full flow and why revenue is attributed via
+// placements rather than /companies/{id}/people.
 
 const AGENCY_SLUG = "Lignum-group";
 const BASE_URL = `https://app.loxo.co/api/${AGENCY_SLUG}`;
@@ -159,20 +161,15 @@ export async function findCompany(name: string): Promise<Company | null> {
   return null;
 }
 
-export async function fetchCompanyPeople(companyId: number): Promise<number[]> {
-  const ids: number[] = [];
-  for await (const person of paginate<{ id?: number }>(`companies/${companyId}/people`)) {
-    if (person.id != null) ids.push(person.id);
-  }
-  return ids;
-}
-
 interface Placement {
   fee_type?: { key?: string } | null;
   fee?: string | number | null;
   salary?: string | number | null;
   bill_rate?: string | number | null;
   pay_rate?: string | number | null;
+  job?: { company?: { id?: number } | null } | null;
+  person?: { id?: number } | null;
+  job_type?: { name?: string } | null;
 }
 
 function computeRevenue(p: Placement): number {
@@ -187,15 +184,44 @@ function computeRevenue(p: Placement): number {
   return billRate - payRate;
 }
 
-export async function revenueForPeople(personIds: number[]): Promise<number> {
-  let total = 0;
-  for (const batch of chunked(personIds, ID_BATCH_SIZE)) {
-    const query = `person_id:(${batch.join(" OR ")})`;
-    for await (const p of paginate<Placement>("placements", { params: { query } })) {
-      total += computeRevenue(p);
-    }
+// Dropout placements are internal reversal/adjustment records (a candidate
+// who fell through), not real revenue. Confirmed with a real example:
+// Western Building Group placement 48128 has job_type "Dropout", fee
+// -22667.43, and notes literally saying "this is just adding the actual
+// dropout onto the figures ... a credit is not necessary anymore" -
+// summing it double-counted against the same candidate's real placement.
+function isDropout(p: Placement): boolean {
+  return p.job_type?.name === "Dropout";
+}
+
+// Revenue/jobs/CVs are attributed via placements[].job.company - the
+// company a candidate was PLACED AT - not via /companies/{id}/people
+// (a company's own contacts/staff, an unrelated set of people). Confirmed
+// with real data: KENPAT has $51,000 of real revenue from a candidate who
+// isn't in KENPAT's own contact list at all - attributing by contacts
+// silently produced $0 for a company that actually made $51,000.
+//
+// /placements has no company_id filter (only job_id is a structured filter,
+// and the free-text query only fuzzy-matches company_name, not company_id
+// exactly - confirmed against the Loxo OpenAPI spec), so this narrows via
+// the company name search first (fast) and falls back to a full unfiltered
+// scan only if that finds nothing for this company id (fuzzy search can
+// miss a company entirely - same safety net loxo_report.py's predecessor
+// script used).
+async function placementsForCompany(companyId: number, companyName: string): Promise<Placement[]> {
+  const seen = new Set<unknown>();
+  const matches: Placement[] = [];
+  for await (const p of paginate<Placement & { id?: unknown }>("placements", { params: { query: companyName } })) {
+    if (seen.has(p.id)) continue;
+    seen.add(p.id);
+    if (p.job?.company?.id === companyId && !isDropout(p)) matches.push(p);
   }
-  return total;
+  if (matches.length > 0) return matches;
+
+  for await (const p of paginate<Placement>("placements")) {
+    if (p.job?.company?.id === companyId && !isDropout(p)) matches.push(p);
+  }
+  return matches;
 }
 
 interface PersonEvent {
@@ -228,15 +254,14 @@ export interface CompanySummary {
 }
 
 async function summarize(companyId: number, companyName: string): Promise<CompanySummary> {
-  const personIds = await fetchCompanyPeople(companyId);
-  if (personIds.length === 0) {
+  const placements = await placementsForCompany(companyId, companyName);
+  if (placements.length === 0) {
     return { companyId, companyName, totalJobs: 0, totalCvs: 0, totalRevenue: 0 };
   }
 
-  const [revenue, jobsAndCvs] = await Promise.all([
-    revenueForPeople(personIds),
-    jobsAndCvsForPeople(personIds),
-  ]);
+  const revenue = placements.reduce((sum, p) => sum + computeRevenue(p), 0);
+  const personIds = [...new Set(placements.map((p) => p.person?.id).filter((id): id is number => id != null))];
+  const jobsAndCvs = await jobsAndCvsForPeople(personIds);
 
   return {
     companyId,
