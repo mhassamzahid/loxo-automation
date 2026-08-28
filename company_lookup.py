@@ -30,7 +30,7 @@ import urllib.parse
 
 import requests
 
-from loxo_report import BASE_URL, load_token, make_session, paginate, compute_revenue
+from loxo_report import BASE_URL, load_token, make_session, paginate, compute_revenue, fetch_resume_counts
 
 
 def normalize(name):
@@ -75,30 +75,58 @@ def find_company(session, name):
     return None
 
 
-def sum_revenue_for_company(session, company, name):
-    company_id = str(company["id"])
+def matching_placements(session, company_id, name):
+    """Yields every placement for company_id: fast narrowed query search
+    first, falling back to a full unfiltered scan if that finds nothing
+    (fuzzy search can miss a company entirely)."""
     seen_ids = set()
-    total = 0.0
-    count = 0
+    found_any = False
     for p in paginate_query(session, "placements", name):
         if p["id"] in seen_ids:
             continue
         seen_ids.add(p["id"])
         pc = (p.get("job") or {}).get("company") or {}
         if str(pc.get("id")) == company_id:
-            total += compute_revenue(p)
-            count += 1
+            found_any = True
+            yield p
 
-    if count == 0:
+    if not found_any:
         print("Narrowed placements search found nothing for this company, "
               "falling back to a full placements scan...")
         for p in paginate(session, "placements"):
             pc = (p.get("job") or {}).get("company") or {}
             if str(pc.get("id")) == company_id:
-                total += compute_revenue(p)
-                count += 1
+                yield p
 
-    return total, count
+
+def summarize_company(session, workers, company, name):
+    """Sums Total Revenue, distinct Total Jobs (with a placement), and
+    Total CVs (summed resume count of every candidate placed there) -
+    all rolled up across every placement for this one company."""
+    company_id = str(company["id"])
+    total_revenue = 0.0
+    placement_count = 0
+    job_ids = set()
+    person_ids = set()
+    for p in matching_placements(session, company_id, name):
+        total_revenue += compute_revenue(p)
+        placement_count += 1
+        job = p.get("job") or {}
+        person = p.get("person") or {}
+        if job.get("id") is not None:
+            job_ids.add(job["id"])
+        if person.get("id") is not None:
+            person_ids.add(str(person["id"]))
+
+    resume_counts = fetch_resume_counts(session, workers, person_ids, label="placed candidates") if person_ids else {}
+    total_cvs = sum(resume_counts.values())
+
+    return {
+        "placement_count": placement_count,
+        "total_jobs": len(job_ids),
+        "total_cvs": total_cvs,
+        "total_revenue": round(total_revenue, 2),
+    }
 
 
 def main():
@@ -106,6 +134,7 @@ def main():
     parser.add_argument("name", nargs="?", default=None, help="company name to search for")
     parser.add_argument("--company", type=int, default=None,
                          help="skip the name search, use this exact company id (for testing)")
+    parser.add_argument("--workers", type=int, default=10, help="concurrent requests for candidate resume lookups")
     args = parser.parse_args()
     if args.company is None and not args.name:
         parser.error("name is required unless --company is given")
@@ -130,9 +159,11 @@ def main():
             sys.exit(f'No company found matching "{args.name}"')
 
     print(f"Company: {company['name']} (ID {company['id']})")
-    revenue, count = sum_revenue_for_company(session, company, company["name"])
-    print(f"Placements found: {count}")
-    print(f"Total Revenue: {revenue:,.2f}")
+    summary = summarize_company(session, args.workers, company, company["name"])
+    print(f"Placements found: {summary['placement_count']}")
+    print(f"Total Jobs: {summary['total_jobs']}")
+    print(f"Total CVs: {summary['total_cvs']}")
+    print(f"Total Revenue: {summary['total_revenue']:,.2f}")
 
 
 if __name__ == "__main__":
