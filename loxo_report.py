@@ -1,39 +1,43 @@
 #!/usr/bin/env python3
 """
-Loxo reporting script. Produces two output files:
+Loxo company report - one script, one output file: output/company_report.csv
+(Company ID, Company Name, Total Jobs, Total CVs, Total Revenue)
 
-    output/report.csv          (one row per person)
-        ID          - person id (from the People API)
-        Total Jobs  - number of jobs they've been a candidate for (candidate_jobs)
-        Total CVs   - number of resumes/CVs attached to their profile
-        Revenue     - summed revenue across all of their placements
+Flow, exactly as scoped per company (no global full-table scans):
+    1. GET /companies                            - every company (scroll-paginated)
+    2. GET /companies/{id}/people                 - that company's people -> person ids
+    3. GET /placements?query=person_id:(id1 OR id2 ...)
+                                                    - placements for exactly those people,
+                                                      summed into revenue (formula below)
+    4. GET /person_events?query=person_id:(id1 OR id2 ...)
+                                                    - events for exactly those people:
+                                                        - Total CVs: activity_type.key is a
+                                                          CV-sent type (moved_to_cv_sent,
+                                                          delivery_cv_sends)
+                                                        - Total Jobs: distinct job_id values
+                                                          across those events
 
-    output/company_report.csv  (one row per hiring company)
-        Company ID       - company id (from placement.job.company)
-        Company Name
-        Total Jobs       - distinct jobs at that company that had a placement
-        Total Resumes    - summed CV count of every candidate placed there
-        Placement Count  - number of placements made for that company
-        Total Revenue    - summed revenue across all of that company's placements
-        (only companies that appear on at least one placement are listed -
-        there's no companies list endpoint here to enumerate the rest)
+`person_id` is not a plain query-string param on /placements (that 422s) - it's a field
+inside the `query` param's Lucene syntax, confirmed against the Loxo OpenAPI spec and
+tested live: query=person_id:(111 OR 222) returns exactly the placements/events for
+those people. This is what "query by people id" means on this API. A company's people
+are batched into groups of up to ID_BATCH_SIZE to keep the query string a sane length.
 
-Revenue per placement is calculated from the Placements API as:
+For each company, Total Jobs / Total CVs / Total Revenue are the SUM of its own
+people's individual numbers - one row per company, never summed across companies.
+
+Revenue per placement:
     - fee_type "percentage": salary * (fee / 100)
     - fee_type "flat":       fee (already an absolute amount)
     - no fee_type (typical for Contract/MSP placements): bill_rate - pay_rate
       (bill_rate = what we charge the client, pay_rate = what we pay the
       contractor; both legitimately can be 0)
-Both reports sum per-row (per person / per company) - rows are never
-summed together into a single value.
 
 Usage:
-    python3 loxo_report.py                 # full run, both reports
-    python3 loxo_report.py --people-only
-    python3 loxo_report.py --company-only
-    python3 loxo_report.py --workers 15    # concurrency for per-person detail calls
-    python3 loxo_report.py --no-resume     # ignore existing partial report.csv and start over
-    python3 loxo_report.py --limit 500     # cap how many people are processed (report.csv only)
+    python3 loxo_report.py                  # full run, all companies
+    python3 loxo_report.py --limit 50       # only process the first 50 companies (testing)
+    python3 loxo_report.py --workers 15     # concurrency across companies
+    python3 loxo_report.py --no-resume      # ignore existing partial output and start over
 """
 import argparse
 import csv
@@ -53,11 +57,20 @@ BASE_URL = f"https://app.loxo.co/api/{AGENCY_SLUG}"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
-REPORT_CSV = os.path.join(OUTPUT_DIR, "report.csv")
 COMPANY_CSV = os.path.join(OUTPUT_DIR, "company_report.csv")
 
-REPORT_FIELDS = ["ID", "Total Jobs", "Total CVs", "Revenue"]
-COMPANY_FIELDS = ["Company ID", "Company Name", "Total Jobs", "Total Resumes", "Placement Count", "Total Revenue"]
+COMPANY_FIELDS = ["Company ID", "Company Name", "Total Jobs", "Total CVs", "Total Revenue"]
+
+# The two activity_type keys in this agency's /person_events data that
+# represent a CV/resume being sent (out of ~70 distinct activity types -
+# interview stages, calls, emails, notes, etc. are excluded).
+CV_EVENT_KEYS = {"moved_to_cv_sent", "delivery_cv_sends"}
+
+# How many person ids to OR together in one Lucene query. The API hard-caps
+# this at 26 conditions ("Too many \"OR\" conditions in query", confirmed
+# live on both /placements and /person_events) - 25 leaves a safety margin.
+# A company with more people than this gets its people queried in batches.
+ID_BATCH_SIZE = 25
 
 
 def load_token():
@@ -79,7 +92,6 @@ def load_token():
         if key.strip().upper() in candidate_keys:
             return value.strip().strip('"').strip("'")
 
-    # Fall back to treating the whole file as a bare token (no KEY= prefix).
     token = raw.splitlines()[0].strip() if raw else ""
     if not token:
         sys.exit("Could not find a bearer token in .env")
@@ -90,10 +102,11 @@ def make_session(token):
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
     retry = Retry(
-        total=5,
-        backoff_factor=1.5,
+        total=3,
+        backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
+        respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
@@ -101,19 +114,23 @@ def make_session(token):
     return session
 
 
-def paginate(session, path, per_page=None):
+def paginate(session, path, params=None, per_page=None):
     """Generic scroll-cursor pagination for Loxo list endpoints.
     Yields each raw item dict; stops when a page comes back empty.
-    per_page is only honored where the endpoint actually supports it
-    (e.g. /people accepts it, /placements returns 422 if it's set)."""
-    url = f"{BASE_URL}/{path}"
+    `params` (e.g. {"query": "..."}) is re-sent on every page - the
+    scroll_id alone does NOT preserve a query filter (confirmed live:
+    dropping it resets the result set back to everything unfiltered)."""
+    key = path.rsplit("/", 1)[-1]  # e.g. "companies/123/people" -> "people"
+    base_params = dict(params or {})
     if per_page:
-        url += f"?per_page={per_page}"
+        base_params["per_page"] = per_page
+
+    request_params = dict(base_params)
     while True:
-        resp = session.get(url, timeout=30)
+        resp = session.get(f"{BASE_URL}/{path}", params=request_params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        items = data.get(path, [])
+        items = data.get(key, [])
         if not items:
             return
         for item in items:
@@ -121,21 +138,14 @@ def paginate(session, path, per_page=None):
         scroll_id = data.get("scroll_id")
         if not scroll_id:
             return
-        url = f"{BASE_URL}/{path}?scroll_id={scroll_id}"
+        request_params = dict(base_params)
+        request_params["scroll_id"] = scroll_id
 
 
-def fetch_person_detail(session, person_id):
-    resp = session.get(f"{BASE_URL}/people/{person_id}", timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def load_processed_ids(csv_path):
-    if not os.path.exists(csv_path):
-        return set()
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        return {row["ID"] for row in reader}
+def chunked(seq, size):
+    seq = list(seq)
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
 
 
 def compute_revenue(p):
@@ -149,189 +159,130 @@ def compute_revenue(p):
         return salary * (fee / 100.0)
     if fee_type == "flat" and fee:
         return fee
-    # No fee set (typical for Contract/MSP placements): fall back to the
-    # bill/pay rate margin. Both values legitimately can be 0.
     return bill_rate - pay_rate
 
 
-def build_placement_aggregates(session):
-    """Pulls every placement once and rolls it up two ways:
-      - revenue_by_person: person_id(str) -> summed revenue
-      - company_agg: company_id(str) -> {name, placement_count, revenue,
-        job_ids (set), person_ids (set)}
-    A person/company with multiple placements gets one summed total here;
-    nothing is written to disk in this function."""
-    print("Fetching placements (paginating) and calculating revenue...")
-    revenue_by_person = {}
-    company_agg = {}
-    count = 0
-    for p in paginate(session, "placements"):
-        revenue = compute_revenue(p)
-        person = p.get("person") or {}
-        job = p.get("job") or {}
-        company = job.get("company") or {}
-
+def fetch_company_people(session, company_id):
+    person_ids = []
+    for person in paginate(session, f"companies/{company_id}/people"):
         if person.get("id") is not None:
-            pid = str(person["id"])
-            revenue_by_person[pid] = revenue_by_person.get(pid, 0.0) + revenue
-
-        if company.get("id") is not None:
-            cid = str(company["id"])
-            entry = company_agg.setdefault(cid, {
-                "name": company.get("name") or "",
-                "placement_count": 0,
-                "revenue": 0.0,
-                "job_ids": set(),
-                "person_ids": set(),
-            })
-            entry["placement_count"] += 1
-            entry["revenue"] += revenue
-            if job.get("id") is not None:
-                entry["job_ids"].add(job["id"])
-            if person.get("id") is not None:
-                entry["person_ids"].add(str(person["id"]))
-
-        count += 1
-        if count % 200 == 0:
-            print(f"  processed {count} placements...")
-    print(f"  done: {count} placements across {len(revenue_by_person)} people "
-          f"and {len(company_agg)} companies.")
-    return revenue_by_person, company_agg
+            person_ids.append(person["id"])
+    return person_ids
 
 
-def fetch_resume_counts(session, workers, person_ids, label="people", on_result=None):
-    """Concurrently fetches person detail for each id in person_ids and
-    returns {person_id(str): resume_count}. Failures are logged and
-    omitted (caller sees 0 for a missing id). If on_result is given, it's
-    called as (pid, count) for each success as soon as it completes -
-    used by run_report to flush rows to disk incrementally on long runs."""
-    resume_counts = {}
-    lock = Lock()
-    done = 0
-    total = len(person_ids)
-
-    def worker(pid):
-        try:
-            detail = fetch_person_detail(session, pid)
-            return pid, len(detail.get("resumes") or [])
-        except requests.RequestException as e:
-            print(f"  ! failed to fetch person {pid}: {e}", file=sys.stderr)
-            return pid, None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(worker, pid) for pid in person_ids]
-        for future in concurrent.futures.as_completed(futures):
-            pid, count = future.result()
-            with lock:
-                done += 1
-                if done % 200 == 0:
-                    print(f"  resolved resumes for {done}/{total} {label}...")
-            if count is not None:
-                resume_counts[pid] = count
-                if on_result:
-                    on_result(pid, count)
-    return resume_counts
+def revenue_for_people(session, person_ids):
+    total = 0.0
+    for batch in chunked(person_ids, ID_BATCH_SIZE):
+        query = "person_id:(" + " OR ".join(str(i) for i in batch) + ")"
+        for p in paginate(session, "placements", params={"query": query}):
+            total += compute_revenue(p)
+    return total
 
 
-def run_report(session, workers, resume, revenue_by_person, limit=None):
+def jobs_and_cvs_for_people(session, person_ids):
+    cv_count = 0
+    job_ids = set()
+    for batch in chunked(person_ids, ID_BATCH_SIZE):
+        query = "person_id:(" + " OR ".join(str(i) for i in batch) + ")"
+        for e in paginate(session, "person_events", params={"query": query}, per_page=100):
+            activity_key = (e.get("activity_type") or {}).get("key")
+            if activity_key in CV_EVENT_KEYS:
+                cv_count += 1
+            if e.get("job_id") is not None:
+                job_ids.add(e["job_id"])
+    return len(job_ids), cv_count
+
+
+def load_processed_ids(csv_path):
+    if not os.path.exists(csv_path):
+        return set()
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        return {row["Company ID"] for row in reader}
+
+
+def run(session, workers, resume, limit=None):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    processed_ids = load_processed_ids(REPORT_CSV) if resume else set()
-    write_header = not (resume and os.path.exists(REPORT_CSV))
-    file_mode = "a" if (resume and os.path.exists(REPORT_CSV)) else "w"
+    processed_ids = load_processed_ids(COMPANY_CSV) if resume else set()
+    write_header = not (resume and os.path.exists(COMPANY_CSV))
+    file_mode = "a" if (resume and os.path.exists(COMPANY_CSV)) else "w"
 
-    print("Fetching people list (paginating)...")
-    people = []
-    for person in paginate(session, "people", per_page=100):
-        pid = str(person["id"])
-        if pid in processed_ids:
+    print("Fetching companies list (paginating)...")
+    companies = []
+    for c in paginate(session, "companies", per_page=100):
+        cid = str(c["id"])
+        if cid in processed_ids:
             continue
-        people.append({
-            "person_id": pid,
-            "job_count": len(person.get("candidate_jobs") or []),
-        })
-        if limit and len(people) >= limit:
+        companies.append({"id": cid, "name": c.get("name") or ""})
+        if limit and len(companies) >= limit:
             break
-    print(f"Found {len(people)} people left to process "
+    print(f"Found {len(companies)} companies left to process "
           f"({len(processed_ids)} already done, resuming)." if processed_ids
-          else f"Found {len(people)} people.")
+          else f"Found {len(companies)} companies.")
 
-    if not people:
-        print("Nothing new to process for report.csv.")
+    if not companies:
+        print("Nothing new to process.")
         return
 
-    job_count_by_id = {p["person_id"]: p["job_count"] for p in people}
-    out_f = open(REPORT_CSV, file_mode, newline="")
-    writer = csv.DictWriter(out_f, fieldnames=REPORT_FIELDS)
+    out_f = open(COMPANY_CSV, file_mode, newline="")
+    writer = csv.DictWriter(out_f, fieldnames=COMPANY_FIELDS)
     if write_header:
         writer.writeheader()
     write_lock = Lock()
+    done = 0
+    lock = Lock()
 
-    def on_result(pid, resume_count):
-        with write_lock:
-            writer.writerow({
-                "ID": pid,
-                "Total Jobs": job_count_by_id[pid],
-                "Total CVs": resume_count,
-                "Revenue": round(revenue_by_person.get(pid, 0.0), 2),
-            })
-            out_f.flush()
+    def worker(c):
+        try:
+            person_ids = fetch_company_people(session, c["id"])
+            if person_ids:
+                revenue = revenue_for_people(session, person_ids)
+                total_jobs, total_cvs = jobs_and_cvs_for_people(session, person_ids)
+            else:
+                revenue, total_jobs, total_cvs = 0.0, 0, 0
+        except requests.RequestException as e:
+            print(f"  ! failed to process company {c['id']}: {e}", file=sys.stderr)
+            return None
 
-    fetch_resume_counts(session, workers, [p["person_id"] for p in people], label="people", on_result=on_result)
+        return {
+            "Company ID": c["id"],
+            "Company Name": c["name"],
+            "Total Jobs": total_jobs,
+            "Total CVs": total_cvs,
+            "Total Revenue": round(revenue, 2),
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(worker, c): c for c in companies}
+        for future in concurrent.futures.as_completed(futures):
+            row = future.result()
+            with lock:
+                done += 1
+                if done % 100 == 0:
+                    print(f"  processed {done}/{len(companies)} companies...")
+            if row is None:
+                continue
+            with write_lock:
+                writer.writerow(row)
+                out_f.flush()
+
     out_f.close()
-    print(f"Report written to {REPORT_CSV} (one row per person, not summed)")
-
-
-def run_company_report(session, workers, company_agg):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    if not company_agg:
-        print("No companies found in placements; skipping company_report.csv.")
-        return
-
-    all_person_ids = set()
-    for entry in company_agg.values():
-        all_person_ids |= entry["person_ids"]
-
-    print(f"Resolving CV counts for {len(all_person_ids)} placed candidates (for company rollup)...")
-    resume_counts = fetch_resume_counts(session, workers, all_person_ids, label="placed candidates")
-
-    with open(COMPANY_CSV, "w", newline="") as out_f:
-        writer = csv.DictWriter(out_f, fieldnames=COMPANY_FIELDS)
-        writer.writeheader()
-        for cid, entry in company_agg.items():
-            total_resumes = sum(resume_counts.get(pid, 0) for pid in entry["person_ids"])
-            writer.writerow({
-                "Company ID": cid,
-                "Company Name": entry["name"],
-                "Total Jobs": len(entry["job_ids"]),
-                "Total Resumes": total_resumes,
-                "Placement Count": entry["placement_count"],
-                "Total Revenue": round(entry["revenue"], 2),
-            })
     print(f"Company report written to {COMPANY_CSV} (one row per company, not summed)")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Loxo people & placements reporting")
-    parser.add_argument("--workers", type=int, default=10, help="concurrent requests for person detail calls")
-    parser.add_argument("--no-resume", action="store_true", help="ignore existing partial report.csv and start over")
-    parser.add_argument("--limit", type=int, default=None, help="only process this many people in report.csv (e.g. for a quick test run)")
-    parser.add_argument("--people-only", action="store_true", help="only write report.csv, skip company_report.csv")
-    parser.add_argument("--company-only", action="store_true", help="only write company_report.csv, skip report.csv")
+    parser = argparse.ArgumentParser(description="Loxo company report: jobs, CVs, revenue per company")
+    parser.add_argument("--workers", type=int, default=5, help="concurrent requests across companies")
+    parser.add_argument("--no-resume", action="store_true", help="ignore existing partial output and start over")
+    parser.add_argument("--limit", type=int, default=None, help="only process this many companies (e.g. for a quick test run)")
     args = parser.parse_args()
 
     token = load_token()
     session = make_session(token)
 
     t0 = time.time()
-    revenue_by_person, company_agg = build_placement_aggregates(session)
-
-    if not args.company_only:
-        run_report(session, workers=args.workers, resume=not args.no_resume,
-                   revenue_by_person=revenue_by_person, limit=args.limit)
-    if not args.people_only:
-        run_company_report(session, workers=args.workers, company_agg=company_agg)
+    run(session, workers=args.workers, resume=not args.no_resume, limit=args.limit)
     print(f"Done in {time.time() - t0:.1f}s")
 
 
